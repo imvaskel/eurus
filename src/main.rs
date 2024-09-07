@@ -9,7 +9,9 @@ use std::{
 
 use color_eyre::eyre::{bail, ensure, Context, ContextCompat, Result};
 use directories::ProjectDirs;
-use docker_compose_types::{Compose, ComposeNetwork, Labels, MapOrEmpty, NetworkSettings, Networks};
+use docker_compose_types::{
+    Compose, ComposeNetwork, Labels, MapOrEmpty, NetworkSettings, Networks,
+};
 use inquire::{Autocomplete, Editor, Select, Text};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -73,6 +75,7 @@ impl Display for ZoneInfo {
 #[derive(Debug, Deserialize, Serialize, Default)]
 struct Config {
     zones: Vec<ZoneInfo>,
+    cloudflare_key: String,
     traefik_network: String,
     traefik_tls: String,
 }
@@ -113,7 +116,7 @@ fn get_config() -> Result<Config> {
         .context("Failed to create config directory")?;
 
     serde_json::from_str(&std::fs::read_to_string(&*CONFIG_DIR.join("config.json"))?)
-            .context("Configuration is malformed.")
+        .context("Configuration is malformed.")
 }
 
 fn prompt_new_zone_config(api_key: &str) -> Result<Config> {
@@ -136,6 +139,7 @@ fn prompt_new_zone_config(api_key: &str) -> Result<Config> {
             id: zone_id,
             name: res.result.unwrap().name, // We check for errors earlier.
         }],
+        cloudflare_key: api_key.to_string(),
         ..Default::default()
     };
     std::fs::write(
@@ -147,30 +151,31 @@ fn prompt_new_zone_config(api_key: &str) -> Result<Config> {
 }
 
 fn dns() -> Result<()> {
-    let api_key = std::env::var("CF_API_KEY").or_else(|_| {
-        Text::new("Enter your api key.")
-            .with_help_message(
-                "This can also be provided via the `CF_API_KEY` environment variable.",
-            )
-            .prompt()
-    })?;
-
     let config: Config = match get_config() {
         Ok(c) => {
             if c.zones.is_empty() {
-                prompt_new_zone_config(&api_key)?
+                prompt_new_zone_config(&c.cloudflare_key)?
             } else {
                 c
             }
         }
-        Err(_) => prompt_new_zone_config(&api_key)?,
+        Err(_) => {
+            let api_key = std::env::var("CF_API_KEY").or_else(|_| {
+                Text::new("Enter your api key.")
+                    .with_help_message(
+                        "This can also be provided via the `CF_API_KEY` environment variable.",
+                    )
+                    .prompt()
+            })?;
+            prompt_new_zone_config(&api_key)?
+        }
     };
 
     let domain = Select::new("Select a zone", config.zones).prompt()?;
 
     let res: CloudflareResponse<Vec<DnsListResponse>> = (*CLIENT)
         .get(format!("{BASE_URL}/zones/{}/dns_records", &domain.id))
-        .bearer_auth(&api_key)
+        .bearer_auth(&config.cloudflare_key)
         .send()?
         .json()?;
 
@@ -195,7 +200,8 @@ fn dns() -> Result<()> {
 
     let info = domains
         .iter()
-        .find(|d| d.name == subdomain.clone()).cloned();
+        .find(|d| d.name == subdomain.clone())
+        .cloned();
 
     let body = DnsCreateUpdate {
         name: subdomain,
@@ -213,14 +219,14 @@ fn dns() -> Result<()> {
                 info.unwrap().id
             ))
             .json(&body)
-            .bearer_auth(&api_key)
+            .bearer_auth(&config.cloudflare_key)
             .send()?
             .json()?
     } else {
         (*CLIENT)
             .post(format!("{BASE_URL}/zones/{}/dns_records", &domain.id))
             .json(&body)
-            .bearer_auth(&api_key)
+            .bearer_auth(&config.cloudflare_key)
             .send()?
             .json()?
     };
@@ -381,19 +387,23 @@ fn traefik() -> Result<()> {
     let mut network = compose
         .networks
         .0
-        .get(&config.traefik_network).map(|n| match n {
-                MapOrEmpty::Empty => NetworkSettings {
-                    ..Default::default()
-                },
-                MapOrEmpty::Map(m) => m.clone(),
-            })
+        .get(&config.traefik_network)
+        .map(|n| match n {
+            MapOrEmpty::Empty => NetworkSettings {
+                ..Default::default()
+            },
+            MapOrEmpty::Map(m) => m.clone(),
+        })
         .unwrap_or(NetworkSettings {
             ..Default::default()
         }); // Should never be None
 
     network.external = Some(ComposeNetwork::Bool(true));
 
-    compose.networks.0.insert(config.traefik_network.clone(), MapOrEmpty::Map(network));
+    compose
+        .networks
+        .0
+        .insert(config.traefik_network.clone(), MapOrEmpty::Map(network));
 
     match &mut service.networks {
         Networks::Simple(a) => {
