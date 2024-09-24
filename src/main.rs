@@ -1,18 +1,17 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::HashMap,
     fmt::Display,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
 
+use clap::{Parser, Subcommand};
 use color_eyre::eyre::{bail, ensure, Context, ContextCompat, Result};
 use directories::ProjectDirs;
 use docker_compose_types::{
-    Compose, ComposeNetwork, Labels, MapOrEmpty, NetworkSettings, Networks,
+    Compose, ComposeNetwork, Labels, MapOrEmpty, NetworkSettings, Networks, Service,
 };
-use inquire::{Autocomplete, Editor, Select, Text};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
@@ -60,7 +59,7 @@ struct DnsCreateUpdate {
     content: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
 struct ZoneInfo {
     id: String,
     name: String,
@@ -76,37 +75,23 @@ impl Display for ZoneInfo {
 struct Config {
     zones: Vec<ZoneInfo>,
     cloudflare_key: String,
-    traefik_network: String,
-    traefik_tls: String,
+    caddy_network: String,
 }
 
-#[derive(Debug, Clone)]
-struct SubdomainAutoComplete {
-    current: Vec<String>,
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+#[command(propagate_version = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-impl Autocomplete for SubdomainAutoComplete {
-    fn get_suggestions(
-        &mut self,
-        input: &str,
-    ) -> std::result::Result<Vec<String>, inquire::CustomUserError> {
-        let input = input.to_lowercase();
-        std::result::Result::Ok(
-            self.current
-                .iter()
-                .filter(|i| i.contains(&input))
-                .map(String::from)
-                .collect(),
-        )
-    }
-
-    fn get_completion(
-        &mut self,
-        _: &str,
-        highlighted_suggestion: Option<String>,
-    ) -> std::result::Result<inquire::autocompletion::Replacement, inquire::CustomUserError> {
-        std::result::Result::Ok(highlighted_suggestion)
-    }
+#[derive(Debug, Subcommand, Clone)]
+enum Command {
+    #[command(about = "Change DNS settings via the cloudflare api.")]
+    Dns,
+    #[command(about = "Edit a docker compose file to add caddy proxying.")]
+    Web { path: Option<String> },
 }
 
 fn get_config() -> Result<Config> {
@@ -120,9 +105,7 @@ fn get_config() -> Result<Config> {
 }
 
 fn prompt_new_zone_config(api_key: &str) -> Result<Config> {
-    let zone_id = Text::new("Zone ID:")
-        .with_help_message("This can be found on the dashboard.")
-        .prompt()?;
+    let zone_id = cliclack::input("Zone ID:").interact()?;
 
     let res: CloudflareResponse<ZoneDetailsResponse> = (*CLIENT)
         .get(format!("{}/zones/{}", BASE_URL, zone_id))
@@ -150,7 +133,13 @@ fn prompt_new_zone_config(api_key: &str) -> Result<Config> {
     Ok(conf)
 }
 
+#[derive(Debug, PartialEq, Clone)]
+struct ServiceWrapper(Service, String);
+impl Eq for ServiceWrapper {}
+
 fn dns() -> Result<()> {
+    cliclack::intro("eurus-dns")?;
+
     let config: Config = match get_config() {
         Ok(c) => {
             if c.zones.is_empty() {
@@ -160,18 +149,16 @@ fn dns() -> Result<()> {
             }
         }
         Err(_) => {
-            let api_key = std::env::var("CF_API_KEY").or_else(|_| {
-                Text::new("Enter your api key.")
-                    .with_help_message(
-                        "This can also be provided via the `CF_API_KEY` environment variable.",
-                    )
-                    .prompt()
-            })?;
+            let api_key = std::env::var("CF_API_KEY")
+                .or_else(|_| cliclack::input("Enter your api key.").interact())?;
             prompt_new_zone_config(&api_key)?
         }
     };
 
-    let domain = Select::new("Select a zone", config.zones).prompt()?;
+    let choices: Vec<_> = config.zones.iter().map(|z| (z, &z.name, "")).collect();
+    let domain = cliclack::select("Select a zone")
+        .items(&choices)
+        .interact()?;
 
     let res: CloudflareResponse<Vec<DnsListResponse>> = (*CLIENT)
         .get(format!("{BASE_URL}/zones/{}/dns_records", &domain.id))
@@ -184,19 +171,15 @@ fn dns() -> Result<()> {
     }
 
     let domains = res.result.unwrap().clone();
-    let autocomplete = SubdomainAutoComplete {
-        current: domains.iter().map(|d| d.name.clone()).collect(),
-    };
-    let subdomain = Text::new("What subdomain would you like to modify?")
-        .with_autocomplete(autocomplete)
-        .prompt()?;
+    let subdomain: String =
+        cliclack::input("Which subdomain would you like to modify?").interact()?;
 
-    let record_type = Text::new("What record type is this?")
-        .with_default("CNAME")
-        .prompt()?;
-    let target = Text::new("What is the target?")
-        .with_default(&domain.name)
-        .prompt()?;
+    let record_type = cliclack::input("What record type is this?")
+        .default_input("CNAME")
+        .interact()?;
+    let target = cliclack::input("What is the target?")
+        .default_input(&domain.name)
+        .interact()?;
 
     let info = domains
         .iter()
@@ -256,34 +239,14 @@ fn add_or_ignore_label(labels: &mut Labels, key: &str, value: &str) {
     }
 }
 
-fn traefik() -> Result<()> {
-    static STATIC_LABELS: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
-        HashMap::from([
-            ("traefik.enable", "true"),
-            (
-                "traefik.http.routers.${COMPOSE_PROJECT_NAME}.entrypoints",
-                "websecure",
-            ),
-            ("traefik.http.routers.${COMPOSE_PROJECT_NAME}.tls", "true"),
-        ])
-    });
-    static RULE_LABEL: &str = "traefik.http.routers.${COMPOSE_PROJECT_NAME}.rule";
-    static CERT_RESOLVER_LABEL: &str =
-        "traefik.http.routers.${COMPOSE_PROJECT_NAME}.tls.certresolver";
-    static TRAEFIK_NETWORK_LABEL: &str = "traefik.docker.network";
-    static TRAEFIK_SERVICE_LABEL: &str = "";
-    static TRAEFIK_SERVICE_PORT_LABEL: &str =
-        "traefik.http.services.${COMPOSE_PROJECT_NAME}.loadbalancer.server.port";
+fn web(compose_path: Option<String>) -> Result<()> {
+    cliclack::intro("eurus-web")?;
 
     let config = match get_config() {
         Ok(mut c) => {
-            if c.traefik_network.is_empty() {
-                let network = Text::new("Enter the network that traefik is on.").prompt()?;
-                c.traefik_network = network;
-            }
-            if c.traefik_tls.is_empty() {
-                let tls = Text::new("Enter your TLS provider for traefik.").prompt()?;
-                c.traefik_tls = tls;
+            if c.caddy_network.is_empty() {
+                let network = cliclack::input("Enter the network that caddy is on.").interact()?;
+                c.caddy_network = network;
             }
             std::fs::write(
                 (*CONFIG_DIR).join("config.json"),
@@ -292,11 +255,9 @@ fn traefik() -> Result<()> {
             c
         }
         Err(_) => {
-            let network = Text::new("Enter the network that traefik is on.").prompt()?;
-            let tls = Text::new("Enter your TLS provider for traefik.").prompt()?;
+            let network = cliclack::input("Enter the network that caddy is on.").interact()?;
             let config = Config {
-                traefik_network: network,
-                traefik_tls: tls,
+                caddy_network: network,
                 ..Default::default()
             };
             std::fs::write(
@@ -307,7 +268,7 @@ fn traefik() -> Result<()> {
         }
     };
 
-    let file = match std::env::args().nth(2) {
+    let file = match compose_path {
         Some(s) => PathBuf::from(s),
         None => {
             static COMPOSE_PATHS: [&str; 2] = ["compose.yaml", "docker-compose.yaml"];
@@ -326,68 +287,41 @@ fn traefik() -> Result<()> {
     let mut compose: Compose =
         serde_yml::from_str(&contents).context("The compose yaml was invalid.")?;
 
-    let services = compose.services.0.iter().filter(|e| e.1.is_some());
-    let selected_service = Select::new(
-        "Select the service to add traefik to",
-        services.map(|s| s.0).collect(),
-    )
-    .prompt()?;
-
-    let service = compose
+    let services: Vec<_> = compose
         .services
         .0
-        .get(selected_service)
-        .context("Could not get the service.")?;
+        .iter()
+        .filter(|e| e.1.is_some())
+        .map(|(key, value)| (ServiceWrapper(value.clone().unwrap(), key.clone()), key, ""))
+        .collect();
+    let selected_service = cliclack::select("Select the service to add caddy to")
+        .items(&services)
+        .interact()?;
 
-    let rule = Editor::new("Enter the rule for this service.").prompt()?;
-    let port: Option<u16> = loop {
-        let text = Text::new("Enter the port this application exposes")
-            .with_default("None")
-            .prompt_skippable()?;
+    let domain: String = cliclack::input("Enter the domain for this service.").interact()?;
+    let port: u16 = loop {
+        let text: String = cliclack::input("Enter the port this application exposes").interact()?;
 
-        match text.as_deref() {
-            Some("None") => break None,
-            Some(t) => match t.parse() {
-                Ok(n) => break Some(n),
-                Err(_) => continue,
-            },
-            None => break None,
+        match text.parse() {
+            Ok(n) => break n,
+            Err(_) => (),
         }
     };
 
-    ensure!(service.is_some(), "The service is none.");
+    let mut service = selected_service.0.clone();
 
-    let mut service = service.clone().unwrap();
-    for (key, value) in &*STATIC_LABELS {
-        add_or_ignore_label(&mut service.labels, key, value);
-    }
-
-    add_or_ignore_label(&mut service.labels, RULE_LABEL, &rule);
+    add_or_ignore_label(&mut service.labels, "caddy", &domain);
     add_or_ignore_label(
         &mut service.labels,
-        CERT_RESOLVER_LABEL,
-        &config.traefik_tls,
+        "caddy.reverse_proxy",
+        &format!("{{{{ upstreams {} }}}}", port),
     );
-    add_or_ignore_label(
-        &mut service.labels,
-        TRAEFIK_NETWORK_LABEL,
-        &config.traefik_network,
-    );
-
-    if port.is_some() {
-        let port = port.unwrap();
-        add_or_ignore_label(
-            &mut service.labels,
-            TRAEFIK_SERVICE_PORT_LABEL,
-            &port.to_string(),
-        );
-    }
 
     // get or make the network settings for the traefik network
     let mut network = compose
         .networks
         .0
-        .get(&config.traefik_network)
+        .get(&config.caddy_network)
         .map(|n| match n {
             MapOrEmpty::Empty => NetworkSettings {
                 ..Default::default()
@@ -403,25 +337,28 @@ fn traefik() -> Result<()> {
     compose
         .networks
         .0
-        .insert(config.traefik_network.clone(), MapOrEmpty::Map(network));
+        .insert(config.caddy_network.clone(), MapOrEmpty::Map(network));
 
     match &mut service.networks {
         Networks::Simple(a) => {
-            if !a.contains(&config.traefik_network) {
-                a.push(config.traefik_network);
+            if !a.contains(&config.caddy_network) {
+                a.push(config.caddy_network);
             }
         }
         Networks::Advanced(a) => {
-            a.0.insert(config.traefik_network, MapOrEmpty::Empty);
+            a.0.insert(config.caddy_network, MapOrEmpty::Empty);
         }
     }
 
     compose
         .services
         .0
-        .insert(selected_service.clone(), Some(service));
+        .insert(selected_service.1.clone(), Some(service));
 
+    std::fs::copy(&file, format!("{}.bak", file.display()))?;
     std::fs::write(&file, serde_yml::to_string(&compose)?)?;
+
+    cliclack::outro("Done!")?;
 
     Ok(())
 }
@@ -429,16 +366,10 @@ fn traefik() -> Result<()> {
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let cmd = match std::env::args().nth(1).map(|f| f.to_lowercase()) {
-        Some(s) => s,
-        None => {
-            bail!("no command given.");
-        }
-    };
+    let args = Cli::parse();
 
-    match cmd.as_str() {
-        "dns" => dns(),
-        "traefik" => traefik(),
-        _ => bail!("Invalid command, it should be ``dns`` or ``traefik``."),
+    match args.command {
+        Command::Dns => dns(),
+        Command::Web { path } => web(path),
     }
 }
